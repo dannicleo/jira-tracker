@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'          # dispara em: git tag v1.2.3 && git push --tags
+  workflow_dispatch:  # permite rodar manualmente pela UI do GitHub
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── macOS Apple Silicon ──────────────────────────────────────────
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+
+          # ── macOS Intel ──────────────────────────────────────────────────
+          - platform: macos-13
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+
+          # ── Windows 64-bit ───────────────────────────────────────────────
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: ''
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      # 1. Checkout
+      - uses: actions/checkout@v4
+
+      # 2. Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # 3. Rust
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # 4. Cache Rust (acelera builds subsequentes)
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      # 5. Dependências do sistema — Linux (não usado aqui, mas útil se adicionar Linux)
+      # - name: Install Linux deps
+      #   if: matrix.platform == 'ubuntu-22.04'
+      #   run: |
+      #     sudo apt-get update
+      #     sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      # 6. Instala dependências npm
+      - name: Install frontend deps
+        run: npm ci
+
+      # 7. Build Tauri
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Assinar no macOS (opcional — só funciona se configurar os secrets abaixo)
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Jira Tracker ${{ github.ref_name }}'
+          releaseBody: |
+            ## Downloads
+
+            | Plataforma | Arquivo |
+            |---|---|
+            | macOS Apple Silicon | `.dmg` (aarch64) |
+            | macOS Intel | `.dmg` (x86_64) |
+            | Windows | `.msi` ou `.exe` |
+          releaseDraft: true      # cria como rascunho — você publica manualmente
+          prerelease: false
+          args: ${{ matrix.args }}

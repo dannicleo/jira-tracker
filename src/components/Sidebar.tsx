@@ -9,7 +9,7 @@
  */
 import { useCallback } from "react";
 import {
-  Settings, LayoutGrid, RefreshCw, Loader2, AlertCircle, Bell, History, PenLine, GripVertical,
+  Settings, LayoutGrid, RefreshCw, Loader2, AlertCircle, Bell, History, PenLine, GripVertical, LogOut,
   // Ícones semânticos de coluna
   Circle,          // Todo / genérico "to do"
   Zap,             // In Progress
@@ -293,6 +293,23 @@ export function Sidebar({
         {syncing
           ? <Loader2 size={17} className="animate-spin" />
           : <RefreshCw size={17} />}
+      </button>
+
+      {/* ── Sair ──────────────────────────────────────────── */}
+      <button
+        onClick={() => {
+          import("@tauri-apps/api/window")
+            .then(({ getCurrentWindow }) => getCurrentWindow().close())
+            .catch(() => {});
+        }}
+        title="Fechar aplicativo"
+        className="no-drag w-11 h-11 flex items-center justify-center rounded-xl transition-all group"
+        style={{ color: "var(--sidebar-icon)" }}
+      >
+        <LogOut
+          size={17}
+          className="group-hover:text-red-400 transition-all"
+        />
       </button>
     </div>
   );

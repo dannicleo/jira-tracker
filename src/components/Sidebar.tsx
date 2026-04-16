@@ -136,7 +136,8 @@ export function Sidebar({
   }, []);
 
   return (
-    <div className="sidebar-bar w-14 flex flex-col items-center pb-3 gap-0.5 shrink-0">
+    <div className="sidebar-shadow shrink-0 h-full">
+    <div className="sidebar-bar w-14 h-full flex flex-col items-center pb-3 gap-0.5">
 
       {/* ── Drag handle — arraste para mover a barra ─────── */}
       <div
@@ -311,6 +312,7 @@ export function Sidebar({
           className="group-hover:text-red-400 transition-all"
         />
       </button>
+    </div>
     </div>
   );
 }

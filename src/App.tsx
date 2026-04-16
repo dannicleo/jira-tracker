@@ -360,9 +360,7 @@ export default function App() {
                   draft={draftFormDraft}
                   isNew={draftFormIsNew}
                   issueTypes={board.issueTypes}
-                  settings={settings}
                   projectKey={board.config?.projectKey}
-                  jiraBaseUrl={settings.jira_base_url}
                   onSave={handleDraftSave}
                   onClose={closeDraftForm}
                   onDelete={() => handleDraftDelete(draftFormDraft.id)}

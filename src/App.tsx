@@ -344,6 +344,9 @@ export default function App() {
             settings={settings}
             projectKey={board.config?.projectKey}
             jiraBaseUrl={settings.jira_base_url}
+            columns={board.columns}
+            columnConfigs={board.columnConfigs}
+            workSchedule={board.workSchedule}
           />
         );
 

@@ -811,9 +811,18 @@ export async function fetchDevActivity(
     if (page === MAX_PAGES - 1) truncated = true; // atingiu o limite
   }
 
+  // Deduplica por id — a paginação por `updated DESC` pode repetir issues
+  // se uma delas for atualizada enquanto a busca está em andamento.
+  const seenIds = new Set<string>();
+  const uniqueRaw = allRaw.filter(r => {
+    if (seenIds.has(r.id)) return false;
+    seenIds.add(r.id);
+    return true;
+  });
+
   const results: import("../types").DevActivityIssue[] = [];
 
-  for (const raw of allRaw) {
+  for (const raw of uniqueRaw) {
     const actions: import("../types").DevAction[] = [];
 
     // ── Changelog: transições de status e mudanças de flag ─────────────────
@@ -1687,4 +1696,296 @@ export async function createJiraIssue(
   );
 
   return { key: result.key, id: result.id };
+}
+
+// ─── Relatório de Issues Concluídas ──────────────────────────────────────────
+
+/** Um limite resolvido para exibição no relatório. */
+export interface ReportIssueLimit {
+  label: string;
+  limitHours: number;
+}
+
+/** Issue concluída com tempo gasto na coluna e limites aplicáveis. */
+export interface ReportIssue {
+  key: string;
+  summary: string;
+  issuetype: { name: string; iconUrl?: string };
+  assignee: { displayName: string; avatarUrls: Record<string, string> } | null;
+  priority: { name: string } | null;
+  /** Quando a issue saiu da coluna pela última vez (ISO). */
+  completedAt: string;
+  /** Tempo útil total na coluna (ms) — desconta almoço, fds, feriados e flags. */
+  timeInColumnMs: number;
+  /** Limites aplicáveis para o tipo desta issue. */
+  limits: ReportIssueLimit[];
+}
+
+/**
+ * Calcula o tempo total útil que uma issue ficou nos `columnStatusIds` especificados,
+ * descontando períodos de flag ocorridos durante esse tempo.
+ * Retorna também quando a issue saiu da coluna pela última vez.
+ */
+function computeHistoricalColumnTime(
+  histories: Array<{ created: string; items: Array<{ field: string; from: string; to: string; toString?: string }> }>,
+  columnStatusIds: Set<string>,
+  workSchedule: WorkSchedule
+): { timeMs: number; exitedAt: string | null } {
+  // Ordena do mais antigo para o mais recente
+  const sorted = [...histories].sort(
+    (a, b) => new Date(a.created).getTime() - new Date(b.created).getTime()
+  );
+
+  let totalMs    = 0;
+  let enteredAt: number | null = null;
+  let exitedAt: string | null  = null;
+
+  // Rastreia flags DENTRO do período na coluna
+  let flagStart: number | null = null;
+  let flaggedMs = 0;
+
+  for (const hist of sorted) {
+    const ts = new Date(hist.created).getTime();
+    for (const item of hist.items) {
+      // ── Transições de status ──
+      if (item.field === "status") {
+        const fromIn = columnStatusIds.has(item.from);
+        const toIn   = columnStatusIds.has(item.to);
+
+        if (!fromIn && toIn) {
+          // Entrou na coluna → abre período
+          enteredAt = ts;
+          flagStart = null;
+          flaggedMs = 0;
+        } else if (fromIn && !toIn && enteredAt !== null) {
+          // Saiu da coluna → fecha período
+          // Fecha flag pendente ao sair
+          if (flagStart !== null) {
+            flaggedMs += computeWorkingMs(flagStart, ts, workSchedule);
+            flagStart = null;
+          }
+          const raw = computeWorkingMs(enteredAt, ts, workSchedule);
+          totalMs  += Math.max(0, raw - flaggedMs);
+          exitedAt  = hist.created;
+          enteredAt = null;
+          flaggedMs = 0;
+        }
+      }
+
+      // ── Flags dentro do período na coluna ──
+      if (item.field === "Flagged" && enteredAt !== null) {
+        if (item.toString === "Impediment" && flagStart === null) {
+          flagStart = ts;
+        } else if (item.toString !== "Impediment" && flagStart !== null) {
+          flaggedMs += computeWorkingMs(flagStart, ts, workSchedule);
+          flagStart = null;
+        }
+      }
+    }
+  }
+
+  // Issue ainda está na coluna (edge case para issues não finalizadas)
+  if (enteredAt !== null) {
+    const now = Date.now();
+    if (flagStart !== null) flaggedMs += computeWorkingMs(flagStart, now, workSchedule);
+    totalMs += Math.max(0, computeWorkingMs(enteredAt, now, workSchedule) - flaggedMs);
+  }
+
+  return { timeMs: totalMs, exitedAt };
+}
+
+/**
+ * Resolve os limites aplicáveis a um issue para o relatório.
+ * Espelha a lógica de `getApplicableLimits` do ColumnPanel.
+ */
+function resolveReportLimits(
+  issueTypeName: string,
+  ruleFieldValues: Record<string, number>,
+  limitRules: LimitRule[] | undefined
+): ReportIssueLimit[] {
+  if (!limitRules || limitRules.length === 0) return [];
+
+  const specific  = limitRules.filter(r => r.issueTypes.length > 0 && r.issueTypes.includes(issueTypeName));
+  const catchAll  = limitRules.filter(r => r.issueTypes.length === 0);
+  const candidates = specific.length > 0 ? specific : catchAll;
+
+  const result: ReportIssueLimit[] = [];
+  for (const rule of candidates) {
+    const label = rule.description?.trim() || (rule.timeMode === "fixed" ? "fixo" : "campo");
+    if (rule.timeMode === "fixed" && (rule.fixedHours ?? 0) > 0) {
+      result.push({ label, limitHours: rule.fixedHours! });
+    } else if (rule.timeMode === "field" && rule.fieldId) {
+      const raw = ruleFieldValues[rule.fieldId];
+      if (raw != null) {
+        const hours = (rule.fieldUnit ?? "hours") === "minutes" ? raw / 60 : raw;
+        result.push({ label, limitHours: hours });
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Busca issues que foram concluídas no período especificado e retorna
+ * o tempo que cada uma passou na coluna alvo, comparado com os limites configurados.
+ *
+ * @param columnStatusIds  Status IDs da coluna cujo tempo será medido (ex: "In Progress")
+ * @param limitRules       Regras de limite configuradas para a coluna
+ * @param workSchedule     Horário de trabalho para cálculo de tempo útil
+ */
+export async function fetchReportIssues(
+  startDate: Date,
+  endDate: Date,
+  columnStatusIds: string[],
+  limitRules: LimitRule[] | undefined,
+  workSchedule: WorkSchedule,
+  settings: AppSettings,
+  projectKey?: string
+): Promise<ReportIssue[]> {
+  const start    = formatJqlDate(startDate);
+  const dayAfter = new Date(endDate);
+  dayAfter.setDate(dayAfter.getDate() + 1);
+  const end = formatJqlDate(dayAfter);
+
+  const projectFilter = projectKey ? ` AND project = "${projectKey}"` : "";
+
+  // Coleta fieldIds de regras baseadas em campo para incluir na busca
+  const ruleFieldIds = (limitRules ?? [])
+    .filter(r => r.timeMode === "field" && r.fieldId)
+    .map(r => r.fieldId as string);
+
+  const extraFields = ruleFieldIds.length > 0 ? `,${ruleFieldIds.join(",")}` : "";
+
+  // Busca issues em categoria "Done" atualizadas no período
+  const jql = encodeURIComponent(
+    `statusCategory = "Done"${projectFilter}` +
+    ` AND updated >= "${start}" AND updated < "${end}"` +
+    ` ORDER BY updated DESC`
+  );
+
+  const statusIdSet = new Set(columnStatusIds);
+  const startMs     = startDate.getTime();
+  const endMs       = new Date(endDate).setHours(23, 59, 59, 999);
+
+  const result: ReportIssue[] = [];
+  let startAt = 0;
+  const pageSize = 50;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const data = await jiraFetch<{ issues: any[]; total: number }>(
+      settings.jira_base_url,
+      settings.jira_email,
+      settings.jira_api_token,
+      `/rest/api/3/search/jql?jql=${jql}&maxResults=${pageSize}&startAt=${startAt}` +
+      `&fields=summary,status,issuetype,assignee,priority${extraFields}&expand=changelog`
+    );
+
+    for (const raw of data.issues ?? []) {
+      const histories: any[] = raw.changelog?.histories ?? [];
+
+      const { timeMs, exitedAt } = computeHistoricalColumnTime(
+        histories, statusIdSet, workSchedule
+      );
+
+      // Só inclui se a issue saiu da coluna dentro do período
+      if (!exitedAt) continue;
+      const exitMs = new Date(exitedAt).getTime();
+      if (exitMs < startMs || exitMs > endMs) continue;
+
+      // Extrai valores de campos de regra
+      const ruleFieldValues: Record<string, number> = {};
+      for (const fieldId of ruleFieldIds) {
+        const val = raw.fields?.[fieldId];
+        if (val != null) {
+          const v = typeof val === "object" && val !== null ? val.value ?? val : val;
+          const parsed = parseFloat(String(v));
+          if (!isNaN(parsed) && parsed >= 0) ruleFieldValues[fieldId] = parsed;
+        }
+      }
+
+      const issueTypeName = raw.fields?.issuetype?.name ?? "";
+      const limits = resolveReportLimits(issueTypeName, ruleFieldValues, limitRules);
+
+      result.push({
+        key:      raw.key,
+        summary:  raw.fields.summary,
+        issuetype: raw.fields.issuetype,
+        assignee:  raw.fields.assignee
+          ? { displayName: raw.fields.assignee.displayName, avatarUrls: raw.fields.assignee.avatarUrls }
+          : null,
+        priority:    raw.fields.priority ?? null,
+        completedAt: exitedAt,
+        timeInColumnMs: timeMs,
+        limits,
+      });
+    }
+
+    startAt += pageSize;
+    if (startAt >= (data.total ?? 0)) break;
+  }
+
+  // Ordena pela data de saída mais recente primeiro
+  result.sort((a, b) => new Date(b.completedAt).getTime() - new Date(a.completedAt).getTime());
+  return result;
+}
+
+// ─── Consulta JQL personalizada ───────────────────────────────────────────────
+
+export interface JqlIssue {
+  key:       string;
+  summary:   string;
+  status:    { name: string; statusCategory: { colorName: string } };
+  issuetype?: { name: string; iconUrl: string };
+  assignee?:  { displayName: string; avatarUrls: { "32x32": string } } | null;
+  priority?:  { name: string; iconUrl?: string } | null;
+  updated:   string;
+}
+
+/**
+ * Executa uma query JQL arbitrária e retorna as issues.
+ * Limitado a `maxResults` issues (padrão 100) para evitar explosão de dados.
+ */
+export async function fetchJqlIssues(
+  jql: string,
+  settings: AppSettings,
+  maxResults = 100
+): Promise<{ issues: JqlIssue[]; total: number; truncated: boolean }> {
+  const encoded  = encodeURIComponent(jql.trim());
+  const result: JqlIssue[] = [];
+  let startAt = 0;
+  let total   = 0;
+  const pageSize = 50;
+
+  while (true) {
+    const data = await jiraFetch<{ issues: any[]; total: number }>(
+      settings.jira_base_url,
+      settings.jira_email,
+      settings.jira_api_token,
+      `/rest/api/3/search/jql?jql=${encoded}&maxResults=${pageSize}&startAt=${startAt}` +
+      `&fields=summary,status,issuetype,assignee,priority,updated`
+    );
+    total = data.total ?? 0;
+
+    for (const raw of data.issues ?? []) {
+      if (result.length >= maxResults) break;
+      result.push({
+        key:       raw.key,
+        summary:   raw.fields.summary,
+        status:    raw.fields.status,
+        issuetype: raw.fields.issuetype ?? null,
+        assignee:  raw.fields.assignee
+          ? { displayName: raw.fields.assignee.displayName, avatarUrls: raw.fields.assignee.avatarUrls }
+          : null,
+        priority:  raw.fields.priority ?? null,
+        updated:   raw.fields.updated,
+      });
+    }
+
+    if (result.length >= maxResults) break;
+    startAt += pageSize;
+    if (startAt >= total) break;
+  }
+
+  return { issues: result, total, truncated: total > maxResults };
 }

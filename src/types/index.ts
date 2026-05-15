@@ -608,3 +608,13 @@ export const STATUS_CATEGORY_COLORS: Record<string, StatusBadgeConfig> = {
     bgColor: "bg-green-100",
   },
 };
+
+// ─── JQL Queries salvas ───────────────────────────────────────────────────────
+
+export interface SavedJqlQuery {
+  id:        string;
+  name:      string;
+  query:     string;
+  createdAt: string;
+}
+

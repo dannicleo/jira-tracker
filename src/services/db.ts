@@ -21,6 +21,7 @@ import type {
   CachedIssueType,
   CachedCustomField,
   IssueDraft,
+  SavedJqlQuery,
 } from "../types";
 import { DEFAULT_WORK_SCHEDULE } from "../types";
 import { encrypt, decrypt } from "./crypto";
@@ -73,6 +74,8 @@ const KEYS = {
   // Metadados do Jira (tipos de issue e campos personalizados)
   issueTypes:   "jt:issue-types",
   customFields: "jt:custom-fields",
+  // Queries JQL salvas pelo usuário
+  savedJqlQueries: "jt:jql-queries",
 };
 
 // ─── Issues ──────────────────────────────────────────────────────────────────
@@ -488,4 +491,37 @@ export function deleteDraft(id: string): void {
 /** Gera um id único para um novo rascunho */
 export function newDraftId(): string {
   return `draft-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+// ─── JQL Queries salvas ───────────────────────────────────────────────────────
+
+/** Retorna todas as queries JQL salvas, ordenadas da mais recente para a mais antiga */
+export function getSavedJqlQueries(): SavedJqlQuery[] {
+  try {
+    const raw = localStorage.getItem(KEYS.savedJqlQueries);
+    const list = raw ? (JSON.parse(raw) as SavedJqlQuery[]) : [];
+    return list.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  } catch {
+    return [];
+  }
+}
+
+/** Salva uma nova query JQL com nome */
+export function saveJqlQuery(name: string, query: string): SavedJqlQuery {
+  const list = getSavedJqlQueries();
+  const entry: SavedJqlQuery = {
+    id:        `jql-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    name:      name.trim(),
+    query:     query.trim(),
+    createdAt: new Date().toISOString(),
+  };
+  list.push(entry);
+  localStorage.setItem(KEYS.savedJqlQueries, JSON.stringify(list));
+  return entry;
+}
+
+/** Remove uma query JQL salva pelo id */
+export function deleteJqlQuery(id: string): void {
+  const list = getSavedJqlQueries().filter(q => q.id !== id);
+  localStorage.setItem(KEYS.savedJqlQueries, JSON.stringify(list));
 }
